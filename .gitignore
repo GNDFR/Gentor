@@ -1,0 +1,4 @@
+/target
+upload.bat
+Cargo.lock
+**/settings.json
