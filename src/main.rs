@@ -1,11 +1,11 @@
 use async_openai::{
     config::OpenAIConfig,
     types::{ChatCompletionRequestUserMessage, ChatCompletionRequestUserMessageContent, CreateChatCompletionRequestArgs},
-    Client
+    Client,
 };
 use anyhow::Result;
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind},
+    event::{self, Event, KeyCode, KeyEventKind},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -16,6 +16,7 @@ use std::{
     path::PathBuf,
     time::{Duration, Instant},
 };
+
 use tui::{
     backend::{Backend, CrosstermBackend},
     layout::{Constraint, Direction, Layout},
@@ -26,7 +27,7 @@ use tui::{
 
 const SETTINGS_FILE: &str = "settings.json";
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 struct Settings {
     provider: String,
     model: String,
@@ -92,11 +93,12 @@ async fn main() -> Result<()> {
     // setup terminal
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
     let mut app = App::new(settings);
+    let (response_tx, mut response_rx) = tokio::sync::mpsc::channel::<anyhow::Result<String>>(1);
 
     loop {
         if let Some(time) = app.last_confirm {
@@ -105,9 +107,26 @@ async fn main() -> Result<()> {
                 app.last_confirm = None;
             }
         }
+
+        if let Ok(result) = response_rx.try_recv() {
+            if let Some(last_msg) = app.messages.last() {
+                if last_msg == "🧠 Thinking..." {
+                    app.messages.pop();
+                }
+            }
+            match result {
+                Ok(response) => {
+                    app.messages.push(format!("🤖 {}", response.trim()));
+                }
+                Err(e) => {
+                    app.messages.push(format!("⚠️ Error: {}", e));
+                }
+            }
+        }
+
         terminal.draw(|f| ui(f, &mut app))?;
 
-        if event::poll(Duration::from_millis(100))? {
+        if event::poll(Duration::from_millis(50))? {
             if let Event::Key(key) = event::read()? {
                 match app.state.clone() {
                     AppState::Chat => {
@@ -123,20 +142,22 @@ async fn main() -> Result<()> {
                                         app.last_confirm = None;
                                         app.just_entered_settings = true;
                                     } else if !app.input.is_empty() {
+                                        let prompt = app.input.clone();
+                                        app.messages.push(format!("> {}", prompt));
+                                        app.messages.push("🧠 Thinking...".to_string());
+                                        app.input.clear();
+
+                                        let response_tx_clone = response_tx.clone();
                                         let config = OpenAIConfig::new()
                                             .with_api_key(app.settings.api_key.clone())
                                             .with_api_base(app.settings.base_url.clone());
                                         let client = Client::with_config(config);
-                                        match run_agent(&client, &app.settings.model, &app.input).await {
-                                            Ok(response) => {
-                                                app.messages.push(format!("> {}", app.input));
-                                                app.messages.push(format!("🤖 {}", response.trim()));
-                                            }
-                                            Err(e) => {
-                                                app.messages.push(format!("⚠️ Error: {}", e));
-                                            }
-                                        }
-                                        app.input.clear();
+                                        let model = app.settings.model.clone();
+
+                                        tokio::spawn(async move {
+                                            let result = run_agent(&client, &model, &prompt).await;
+                                            let _ = response_tx_clone.send(result).await;
+                                        });
                                     }
                                 }
                                 KeyCode::Char(c) => {
@@ -208,8 +229,7 @@ async fn main() -> Result<()> {
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
+        LeaveAlternateScreen
     )?;
     terminal.show_cursor()?;
 
